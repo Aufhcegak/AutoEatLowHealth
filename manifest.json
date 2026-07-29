@@ -1,0 +1,10 @@
+{
+  "Name": "Auto Eat Low Health",
+  "Author": "Claude",
+  "Version": "1.0.0",
+  "Description": "血量低于阈值时自动弹出进食询问,选择期间无敌。可设置优先吃的食物与无敌帧开关,联机可用。",
+  "UniqueID": "Claude.AutoEatLowHealth",
+  "EntryDll": "AutoEatLowHealth.dll",
+  "MinimumApiVersion": "4.0.0",
+  "UpdateKeys": []
+}
