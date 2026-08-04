@@ -13,22 +13,23 @@ namespace AutoEatLowHealth;
 /// 濒死自动进食。血量低于阈值时弹出进食询问,选择期间无敌。
 ///
 /// 2026-08-04 联机修复(对照原版源码):
-/// 1. 【对话阶段弹不出/无无敌帧】CanPromptNow 原实现要求 activeClickableMenu==null ——
-///    对话(DialogueBox)开着时永远 false → 不弹窗、不设无敌帧 → 对话期间被打死。
-///    修复:仅当【自己 mod 的提示】或【会挡输入的非对话菜单】打开时才拒绝弹窗;
-///    对话(含问答题)允许弹窗 —— 且弹窗用 createQuestionDialogue 会被已有对话排队,
-///    改为用 Game1.activeClickableMenu 直接开 ItemGrabMenu 风格的专属选择界面?
-///    不 —— 对话阶段最稳妥是【自动吃,不弹窗】:受击时直接按优先级吃,弹窗只留给无菜单时。
-///    同时无敌帧从"弹窗期间"改为"受击触发后到吃完"全程保持(含对话阶段)。
-/// 2. 【吃完还在/回不上血】DoEat 原实现 eatObject(getOne(), false) ——
-///    原版 eatObject(Farmer.cs:9138) hasBuff("6") && !overrideFullness 时拒绝进食
+/// 1. 【无敌的联机一致性】原实现手动刷 temporarilyInvincible(本地字段,联机不同步)
+///    → 访客端无敌帧不同步/对话期间被打死。
+///    修复:改为原版 Buff 机制 —— applyBuff 后 AppliedBuffIds 走 NetField 同步,
+///    配合 CanBeDamaged 前缀(照抄原版雅巴戒指 hasBuff("21") 模式)拦截全部伤害来源。
+///    进食动画期间的原版 isEating 无敌(CanBeDamaged 内含 !isEating)自动接管,无需自己维护。
+/// 2. 【吃完还在/回不上血】原实现 eatObject(getOne(), false) ——
+///    原版 Farmer.cs:9138 hasBuff("6") && !overrideFullness 时拒绝进食
 ///    (饱食 buff 在时 HUD 提示"吃不下了",食物已扣) → "吃完还在"。
 ///    修复:eatObject(o, overrideFullness: true) —— 濒死时无条件进食。
-/// 3. 【无敌帧时长】受击触发设置 currentTemporaryInvincibilityDuration = 100000(玩家帧 100 秒),
-///    原版 Farmer.cs:8478 倒计时走完自动清除。修复:统一 3000ms 足够吃完,弹窗/进食结束显式清除。
-/// 4. 【房主/访客一致】takeDamage prefix 在每端本地执行(伤害 NetEvent 每端广播),
-///    无敌帧/进食都是本地玩家操作,天然一致。修复只保证两端行为相同(原实现已是对称的,
-///    但 CanPromptNow 的菜单限制和 eatObject 参数两端口径统一修正)。
+/// 3. 【贴脸 0 血必死】触发判断原来在 takeDamage 前缀用裸 damage 算 ——
+///    原版真实伤害要经防御/随机减免,裸 damage 对高防玩家误判"会死"。
+///    修复:前缀只拦【必死】(裸 damage ≥ 当前血 —— 减伤只可能让伤害更低,必死判断成立),
+///    低血触发挪到 Postfix(真实扣血后判定)。
+/// 4. 【状态机】保护期(Protecting)内全程刷新 buff(弹窗/自选菜单/等待中都不空窗);
+///    保护结束走唯一出口 EndProtection(吃完 / 回答不吃 / ESC 关弹窗 / 关自选菜单 / 血回阈值上)。
+///    弹窗受冷却约束防轰炸;必死拦截不受冷却约束(保命优先),冷却一过由心跳补弹窗。
+/// 5. 【房主/访客一致】伤害计算(health NetInt 属主)由各玩家本地端结算,Buff 状态 Net 同步 —— 两端行为一致。
 /// </summary>
 public sealed class ModEntry : Mod
 {
@@ -36,13 +37,34 @@ public sealed class ModEntry : Mod
     internal ModConfig Config = null!;
     private IGenericModConfigMenuApi? Gmcm;
 
-    /// <summary>提示是否已打开(无敌帧维持中)。</summary>
+    /// <summary>提问弹窗是否开着(保护 buff 维持中)。</summary>
     internal bool PromptOpen;
+
+    /// <summary>保护期:已进入保护流程,需维持 buff。DoEat/EndProtection 时清除。</summary>
+    internal bool Protecting;
+
+    /// <summary>"我要吃别的..." 自选菜单是否开着(关掉时结束保护)。</summary>
+    private bool PickOtherOpen;
+
+    /// <summary>本周期已触发(延迟回调待执行),防重复。回调执行完/回答后清除。</summary>
+    internal bool Triggered;
+
+    /// <summary>自动连续吃中(弹窗选"吃!"/对话中触发/弹窗超时)。吃到血回阈值上或没食物。</summary>
+    internal bool AutoEating;
+
+    /// <summary>提问弹窗打开时刻(秒),用于超时自动吃。</summary>
+    private double PromptOpenedAt;
+
+    /// <summary>弹窗无回应多久后自动吃(秒)。</summary>
+    private const double PromptAutoEatSeconds = 3.0;
 
     private double LastPromptTime = -999.0;
 
-    /// <summary>受击触发的无敌帧持续时间(毫秒,玩家帧)。足够吃完一轮。</summary>
-    private const int InvincibleMs = 3000;
+    /// <summary>濒死保护 buff id(Net 同步,联机两端一致)。</summary>
+    internal const string InvincibleBuffId = "Claude.AutoEatLowHealth.Invincible";
+
+    /// <summary>保护 buff 时长(毫秒)。保护期每帧刷新,实际由 EndProtection 显式结束。</summary>
+    private const int BuffMs = 60000;
 
     public override void Entry(IModHelper helper)
     {
@@ -57,7 +79,11 @@ public sealed class ModEntry : Mod
         helper.Events.GameLoop.SaveLoaded += (_, _) =>
         {
             PromptOpen = false;
+            Protecting = false;
+            PickOtherOpen = false;
+            Triggered = false;
             LastPromptTime = -999.0;
+            Game1.player.buffs.Remove(InvincibleBuffId);
         };
 
         helper.ConsoleCommands.Add("eat_priority", "打开濒死自动进食的优先级设置界面。", (_, _) =>
@@ -78,18 +104,11 @@ public sealed class ModEntry : Mod
             RegisterGmcm();
     }
 
-    /// <summary>
-    /// 能否触发弹窗/自动吃。
-    /// 联机修复:对话(DialogueBox)不拦 —— 对话阶段也要能触发(否则濒死时在对话里被打死)。
-    /// 只拦"会吃掉输入的独占菜单"(背包/商店等) —— 那些菜单下玩家自己在操作,不该强弹。
-    /// 自己 mod 的提示已开时不重复弹。
-    /// </summary>
-    internal bool CanPromptNow()
+    /// <summary>冷却是否已过(弹窗防轰炸闸)。</summary>
+    internal bool CooldownReady()
     {
-        if (!Context.IsWorldReady || PromptOpen)
+        if (!Context.IsWorldReady)
             return false;
-        if (Game1.activeClickableMenu != null && Game1.activeClickableMenu is not DialogueBox)
-            return false;   // 独占菜单(背包/商店/日记等):不弹,让玩家自己处理
         double now = Game1.currentGameTime?.TotalGameTime.TotalSeconds ?? 0.0;
         return now - LastPromptTime >= Config.CooldownSeconds;
     }
@@ -99,31 +118,83 @@ public sealed class ModEntry : Mod
         LastPromptTime = Game1.currentGameTime?.TotalGameTime.TotalSeconds ?? 0.0;
     }
 
-    /// <summary>受击触发:设置无敌帧 + 弹窗(无菜单时)或自动吃(对话/菜单中)。</summary>
+    /// <summary>开濒死保护 buff(Net 同步,联机两端一致;CanBeDamaged 前缀挡全部伤害来源)。</summary>
+    internal void ApplyProtection()
+    {
+        if (!Config.InvincibleWhilePrompt)
+            return;
+        Game1.player.applyBuff(new Buff(
+            InvincibleBuffId,
+            duration: BuffMs,
+            iconTexture: Game1.buffsIcons,
+            iconSheetIndex: 8,
+            displayName: "濒死保护",
+            description: "血量危险!保护期间无敌,请尽快进食。"));
+    }
+
+    /// <summary>解除保护 buff(进食动画开始后由原版 isEating 无敌自动接管)。</summary>
+    internal void ClearInvincible()
+    {
+        if (!Config.InvincibleWhilePrompt)
+            return;
+        Game1.player.buffs.Remove(InvincibleBuffId);
+    }
+
+    /// <summary>保护无条件开(保命优先);弹窗受冷却约束(防轰炸)。
+    /// 必死一击时即使冷却没过也保命,冷却一过由心跳补弹窗。
+    /// 已有弹窗/自选菜单在等玩家时不重复触发,也不重置菜单状态。</summary>
+    internal void ProtectAndPrompt(Farmer who)
+    {
+        if (PromptOpen || PickOtherOpen || AutoEating)
+            return;
+        Triggered = false;
+        ApplyProtection();
+        Protecting = true;
+        if (CooldownReady())
+        {
+            MarkPrompted();
+            Triggered = true;
+            DelayedAction.functionAfterDelay(() =>
+            {
+                if (who != null && who.IsLocalPlayer && who.health > 0 && Context.IsWorldReady)
+                    OnHitLowHealth(who);
+            }, 50);
+        }
+    }
+
+    /// <summary>已保护但还没弹窗(必死拦截时冷却没过 / 当时菜单挡住)→ 冷却过后补弹窗/自动吃。</summary>
+    internal void TryPrompt(Farmer who)
+    {
+        if (PromptOpen || Triggered || AutoEating || !CooldownReady())
+            return;
+        MarkPrompted();
+        Triggered = true;
+        OnHitLowHealth(who);
+    }
+
+    /// <summary>触发弹窗:无菜单弹窗,对话中自动吃,独占菜单保持保护(等关掉后由心跳补弹窗)。</summary>
     internal void OnHitLowHealth(Farmer who)
     {
-        if (who == null || !who.IsLocalPlayer)
+        if (who == null || !who.IsLocalPlayer || !Context.IsWorldReady)
             return;
 
-        // 无敌帧立即开(对话阶段也生效)
-        SetInvincible();
-
-        if (Game1.activeClickableMenu is DialogueBox)
+        var menu = Game1.activeClickableMenu;
+        if (menu is DialogueBox)
         {
-            // 对话阶段:弹窗会被排队/不显示 → 直接自动吃(按优先级)。
-            // 吃不到就保持无敌帧(玩家退出对话后自己处理)。
-            EatByPriority();
+            // 对话阶段:弹窗会被排队/不显示 → 直接自动连吃(按优先级,吃到血回阈值上或没食物)。
+            EatByPriority(auto: true);
             PromptOpen = false;
+            Triggered = false;
         }
-        else if (Game1.activeClickableMenu == null)
+        else if (menu == null)
         {
             PromptOpen = true;
             OpenPrompt();
         }
         else
         {
-            // 独占菜单(背包等):不开无敌弹窗,保持无敌帧让玩家自己吃
-            PromptOpen = false;
+            // 独占菜单(背包/商店等):不开弹窗,保持保护;菜单一关心跳立刻补弹窗
+            Triggered = false;
         }
     }
 
@@ -131,26 +202,108 @@ public sealed class ModEntry : Mod
     {
         if (!Context.IsWorldReady)
             return;
-        // 提示/进食期间维持无敌帧(原版 Farmer.cs 倒计时自动清除,这里持续刷新直到 ClearInvincible)
-        if (PromptOpen && Config.InvincibleWhilePrompt)
+
+        Farmer player = Game1.player;
+
+        // 保护期(弹窗 / 自选菜单 / 自动连吃中)全程维持 buff —— 防意外过期,也防菜单切换空窗
+        if (Protecting && Config.InvincibleWhilePrompt)
         {
-            Game1.player.temporarilyInvincible = true;
-            Game1.player.temporaryInvincibilityTimer = 0;
-            Game1.player.currentTemporaryInvincibilityDuration = InvincibleMs;
+            player.buffs.Remove(InvincibleBuffId);
+            ApplyProtection();
+        }
+
+        // 提问弹窗超时(无回应)→ 模拟玩家选"吃!"(防 AFK 干等)。
+        // answerDialogue 会同步触发 OnAnswer("yes") → 连吃 + 清状态,一条链路,不会双重吃。
+        if (PromptOpen)
+        {
+            double now = Game1.currentGameTime?.TotalGameTime.TotalSeconds ?? 0.0;
+            if (now - PromptOpenedAt >= PromptAutoEatSeconds)
+            {
+                bool answered =
+                    Game1.activeClickableMenu is DialogueBox db && db.responses != null &&
+                    db.responses.Any(r => r.responseKey == "yes") &&
+                    Game1.currentLocation?.answerDialogue(db.responses[0]) == true;
+                if (!answered)
+                {
+                    // 异常兜底(弹窗不是我们的/已被关):强关 + 手动连吃
+                    PromptOpen = false;
+                    Triggered = false;
+                    if (Game1.activeClickableMenu is DialogueBox)
+                        Game1.activeClickableMenu = null;
+                    EatByPriority(auto: true);
+                }
+            }
+        }
+
+        // 保护期状态机:弹窗被 ESC 关掉 / 自选菜单被关掉 / 连吃完成 → 结束保护
+        if (Protecting)
+        {
+            var menu = Game1.activeClickableMenu;
+            if (PickOtherOpen)
+            {
+                if (menu is not ItemGrabMenu)
+                    EndProtection();
+            }
+            else if (PromptOpen && menu is not DialogueBox)
+            {
+                EndProtection();
+            }
+            else if (AutoEating && !player.isEating)
+            {
+                // 上一口吃完(动画结束 doneEating → isEating=false,回血已结算)→ 血够/没食物结束,否则吃下一口
+                // (注意:itemToEat 原版从不置 null,不能用它判断;isEating 才是"正在吃"信号)
+                if (player.health >= player.maxHealth * Config.HealthThreshold || !HasAnyFood())
+                {
+                    EndProtection();
+                }
+                else
+                {
+                    EatByPriority(auto: true);
+                }
+            }
+        }
+
+        // 血已回到阈值之上 → 结束保护(玩家自己吃药/回血了)
+        if (Protecting && player.health >= player.maxHealth * Config.HealthThreshold)
+        {
+            EndProtection();
+        }
+
+        // 心跳:低血 → 保护;已保护 → 冷却过后补弹窗
+        if (player.health <= 0 || player.maxHealth <= 0)
+            return;
+        if (player.hasBuff(InvincibleBuffId))
+        {
+            TryPrompt(player);
+            return;
+        }
+        if (player.health < player.maxHealth * Config.HealthThreshold && !Game1.killScreen)
+        {
+            if (Game1.activeClickableMenu is ReadyCheckDialog)
+                return;   // 睡觉等待界面,不动
+            ProtectAndPrompt(player);
         }
     }
 
-    private void SetInvincible()
+    private bool HasAnyFood()
     {
-        if (!Config.InvincibleWhilePrompt)
-            return;
-        Game1.player.temporarilyInvincible = true;
-        Game1.player.temporaryInvincibilityTimer = 0;
-        Game1.player.currentTemporaryInvincibilityDuration = InvincibleMs;
+        return Game1.player.Items.Any(IsEdible);
+    }
+
+    /// <summary>结束本轮保护的唯一出口:清状态 + 清 buff。</summary>
+    internal void EndProtection()
+    {
+        PromptOpen = false;
+        PickOtherOpen = false;
+        AutoEating = false;
+        Protecting = false;
+        Triggered = false;
+        ClearInvincible();
     }
 
     private void OpenPrompt()
     {
+        PromptOpenedAt = Game1.currentGameTime?.TotalGameTime.TotalSeconds ?? 0.0;
         var responses = new List<Response>
         {
             new("yes", "吃!(按优先级)"),
@@ -162,30 +315,26 @@ public sealed class ModEntry : Mod
 
     private void OnAnswer(Farmer who, string answer)
     {
-        PromptOpen = false;
         switch (answer)
         {
             case "yes":
-                EatByPriority();
+                PromptOpen = false;
+                Triggered = false;
+                // 连续自动吃:保持保护,每口吃完动画结束接着吃,直到血回阈值上或没食物
+                EatByPriority(auto: true);
                 break;
             case "other":
-                OpenPickOther();
+                PromptOpen = false;
+                Triggered = false;
+                OpenPickOther();   // 保持保护,菜单开着
                 break;
             default:
-                ClearInvincible();
+                EndProtection();
                 break;
         }
     }
 
-    internal void ClearInvincible()
-    {
-        if (!Config.InvincibleWhilePrompt)
-            return;
-        Game1.player.temporarilyInvincible = false;
-        Game1.player.temporaryInvincibilityTimer = 0;
-    }
-
-    private void EatByPriority()
+    private void EatByPriority(bool auto = false)
     {
         Object? food = PickFood();
         if (food == null)
@@ -196,6 +345,8 @@ public sealed class ModEntry : Mod
         {
             DoEat(food);
         }
+        if (auto)
+            AutoEating = food != null;
     }
 
     private Object? PickFood()
@@ -213,25 +364,57 @@ public sealed class ModEntry : Mod
     }
 
     /// <summary>
-    /// 吃食物。联机修复:eatObject 必须 overrideFullness:true ——
-    /// 原版 Farmer.cs:9138 hasBuff("6") && !overrideFullness 时拒绝进食(饱食 buff 在,
-    /// HUD 提示"吃不下了",但调用方已扣食物) → "吃完还在/回不上血"。濒死时无条件进食。
+    /// 吃食物。overrideFullness:true —— 原版 Farmer.cs:9138 hasBuff("6") && !overrideFullness
+    /// 时拒绝进食(饱食 buff 在,HUD 提示"吃不下了",但调用方已扣食物) → "吃完还在/回不上血"。
+    /// 时序:保护 buff 在 eatObject 前保持(eatObject 同步置 isEating=true,原版无敌接管),
+    /// 吃完后由 UpdateTicked 状态机收口 —— 连吃模式自动吃下一口,单吃/血回阈值上/没食物才结束保护。
     /// </summary>
-    private void DoEat(Object food)
+    internal void DoEat(Object food)
     {
+        Object? eatItem = food.getOne() as Object ?? food;
         if (food.Stack > 1)
             food.Stack--;
         else
             Game1.player.Items.Remove(food);
 
         // ⚠️ 关键:overrideFullness=true —— 濒死时无视饱食 buff 强制进食
-        Game1.player.eatObject(food.getOne() as Object ?? food, overrideFullness: true);
-        ClearInvincible();
+        Game1.player.eatObject(eatItem, overrideFullness: true);
         Game1.addHUDMessage(new HUDMessage("吃掉了 " + food.DisplayName, HUDMessage.achievement_type));
+    }
+
+    /// <summary>
+    /// 从自选菜单吃(修复"杨桃永不消失"):菜单点击会把物品从背包移到 heldItem(槽位变空),
+    /// 回调拿到的是 heldItem 里的原对象 —— 若只吃副本不消费,原对象会被放回背包 → 无限吃。
+    /// 照抄原版星之果实分支(heldItem=null 消费):吃一个副本,剩余放回背包,清掉 heldItem。
+    /// </summary>
+    private void EatFromMenu(Object chosen)
+    {
+        Object? eatItem = chosen.getOne() as Object;
+        if (eatItem == null)
+            return;
+
+        if (chosen.Stack > 1)
+        {
+            chosen.Stack--;
+            if (Game1.activeClickableMenu is ItemGrabMenu m)
+                m.heldItem = null;
+            Game1.player.addItemToInventoryBool(chosen);   // 剩余放回背包
+        }
+        else
+        {
+            // 最后一个:吃掉,不再放回 → 从背包消失
+            if (Game1.activeClickableMenu is ItemGrabMenu m)
+                m.heldItem = null;
+        }
+
+        Game1.player.eatObject(eatItem, overrideFullness: true);
+        EndProtection();
+        Game1.addHUDMessage(new HUDMessage("吃掉了 " + chosen.DisplayName, HUDMessage.achievement_type));
     }
 
     private void OpenPickOther()
     {
+        PickOtherOpen = true;
         Game1.activeClickableMenu = new ItemGrabMenu(
             Game1.player.Items,
             reverseGrab: false,
@@ -240,7 +423,7 @@ public sealed class ModEntry : Mod
             (chosen, _) =>
             {
                 if (chosen is Object obj && IsEdible(obj))
-                    DoEat(obj);
+                    EatFromMenu(obj);
             },
             "选择一样要吃的东西",
             null,
@@ -257,7 +440,7 @@ public sealed class ModEntry : Mod
 
     private bool IsEdible(Item item)
     {
-        return item is Object obj && obj.Edibility >= 0 && obj.QualifiedItemId != "(O)447";
+        return item is Object obj && obj.Edibility >= 0;
     }
 
     private void RegisterGmcm()
@@ -277,7 +460,7 @@ public sealed class ModEntry : Mod
             getValue: () => Config.InvincibleWhilePrompt,
             setValue: v => Config.InvincibleWhilePrompt = v,
             name: () => "选择期间无敌",
-            tooltip: () => "触发后/进食期间进入无敌帧(对话中同样生效)。",
+            tooltip: () => "触发后/进食期间无敌(通过游戏内 buff 同步,联机房主访客一致;进食动画由原版机制接管)。",
             fieldId: "invincible");
         Gmcm.AddNumberOption(ModManifest,
             getValue: () => Config.CooldownSeconds,
@@ -290,40 +473,81 @@ public sealed class ModEntry : Mod
     }
 }
 
-/// <summary>受击前缀:血量低于阈值 → 触发进食 + 无敌帧(联机每端本地执行,房主访客一致)。</summary>
-[HarmonyPatch(typeof(Farmer), "takeDamage")]
-internal static class TakeDamagePatch
+/// <summary>濒死保护 buff 生效期间不可受伤 —— 照抄原版雅巴戒指模式(Farmer.cs:7284 !hasBuff("21"))。
+/// 所有伤害来源(checkDamage 近战 / 弹射物 / 炸弹 / 火车)最终都走 takeDamage 内的 CanBeDamaged 判断。</summary>
+[HarmonyPatch(typeof(Farmer), nameof(Farmer.CanBeDamaged))]
+internal static class CanBeDamagedPatch
 {
-    private static bool Prefix(Farmer __instance, int damage, Monster? damager)
+    private static bool Prefix(Farmer __instance, ref bool __result)
     {
         try
         {
-            ModEntry mod = ModEntry.Instance;
-            if (mod == null || !mod.Config.InvincibleWhilePrompt)
-                return true;
-            if (!__instance.IsLocalPlayer || mod.PromptOpen)
-                return true;
-            // 无敌帧已开且不是本 mod 触发 → 放行原版(原版无敌帧照常工作)
-            if (__instance.temporarilyInvincible)
-                return true;
-            int maxHealth = __instance.maxHealth;
-            if (maxHealth <= 0)
-                return true;
-            float ratio = (float)(__instance.health - damage) / maxHealth;
-            if (ratio >= mod.Config.HealthThreshold)
-                return true;
-            if (!mod.CanPromptNow())
-                return true;
-
-            mod.MarkPrompted();
-            // 延迟一帧触发(等本次伤害结算完成,避免递归/竞态)
-            DelayedAction.functionAfterDelay(() => mod.OnHitLowHealth(__instance), 50);
-            // 拦截本次伤害(濒死一击直接挡下)
-            return false;
+            if (__instance.IsLocalPlayer && __instance.hasBuff(ModEntry.InvincibleBuffId))
+            {
+                __result = false;
+                return false;
+            }
+            return true;
         }
         catch (Exception)
         {
             return true;   // 异常放行原版,绝不拖垮玩家
+        }
+    }
+}
+
+/// <summary>受击前缀:只拦【必死】一击(裸伤害 ≥ 当前血 —— 减伤只会让伤害更低,判断成立)
+/// → 开保护 + 拦截。低血触发改由 Postfix 在真实扣血后判定。
+/// 拦截不受 InvincibleWhilePrompt 开关影响(保命是核心功能);开关只控制保护 buff。</summary>
+[HarmonyPatch(typeof(Farmer), "takeDamage")]
+internal static class TakeDamagePatch
+{
+    private static bool Prefix(Farmer __instance, int damage)
+    {
+        try
+        {
+            ModEntry mod = ModEntry.Instance;
+            if (mod == null || mod.AutoEating)
+                return true;
+            if (!__instance.IsLocalPlayer || __instance.temporarilyInvincible || mod.Triggered)
+                return true;
+            if (__instance.health <= 0)
+                return true;
+
+            // 原版实际伤害 = Math.Max(1, damage - Defense[±30% 随机])(Farmer.cs:7343)
+            // 减伤只会让伤害更低 → 裸伤害 ≥ 当前血 即必死(减伤后的伤害只会 ≤ damage)
+            if (damage >= __instance.health)
+            {
+                mod.ProtectAndPrompt(__instance);
+                return false;   // 拦截必死一击
+            }
+            return true;
+        }
+        catch (Exception)
+        {
+            return true;   // 异常放行原版,绝不拖垮玩家
+        }
+    }
+
+    /// <summary>受击后缀:真实扣血后判定 —— 低于阈值 → 进入保护流程。
+    /// (前缀只拦必死;这里覆盖"没死但已低血",以及真实伤害经减伤后跌破阈值的场景)</summary>
+    private static void Postfix(Farmer __instance)
+    {
+        try
+        {
+            ModEntry mod = ModEntry.Instance;
+            if (mod == null || mod.PromptOpen || mod.Triggered || mod.AutoEating)
+                return;
+            if (!__instance.IsLocalPlayer || __instance.health <= 0 || __instance.maxHealth <= 0)
+                return;
+            if (Game1.activeClickableMenu is ReadyCheckDialog)
+                return;
+            if (__instance.health < __instance.maxHealth * mod.Config.HealthThreshold)
+                mod.ProtectAndPrompt(__instance);
+        }
+        catch (Exception)
+        {
+            // 异常放行原版
         }
     }
 }
