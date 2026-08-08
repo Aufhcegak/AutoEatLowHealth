@@ -1,0 +1,27 @@
+# 构建产物(成品入库前必须清理,测试结束后删除)
+bin/
+obj/
+logic_test/bin/
+logic_test/obj/
+*.dll
+*.pdb
+*.deps.json
+*.runtimeconfig.json
+
+# 测试触发/输出文件
+autotest.txt
+autotest_result.txt
+
+# 性能采样数据
+perfmon-*.csv
+
+# IDE/系统文件
+.vs/
+*.user
+.idea/
+Thumbs.db
+Desktop.ini
+
+# 本 mod 特有
+config.json
+# 个人配置(不进仓库,保留本地)

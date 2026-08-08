@@ -1,6 +1,0 @@
-{
-  "HealthThreshold": 0.4,
-  "InvincibleWhilePrompt": true,
-  "CooldownSeconds": 5,
-  "FoodPriority": []
-}
